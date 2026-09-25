@@ -37,9 +37,16 @@ class StepIn(BaseModel):
     minutes: float
 
 
+class PressureIn(BaseModel):
+    pot_no: str = Field(min_length=1, max_length=40)
+    pressure_text: str = Field(min_length=1, max_length=80)
+    read_at: datetime | None = None
+
+
 class BatchIn(BaseModel):
     herb: str = Field(min_length=1, max_length=80)
     steps: list[StepIn]
+    pressure_id: int | None = None
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -75,6 +82,17 @@ def startup():
                 reason text NOT NULL,
                 created_by text NOT NULL,
                 created_at timestamptz NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS pressure_readings (
+                id serial PRIMARY KEY,
+                pot_no text NOT NULL,
+                pressure_text text NOT NULL,
+                read_at timestamptz NOT NULL,
+                created_by text NOT NULL,
+                created_at timestamptz NOT NULL,
+                used_by_batch_id integer REFERENCES batches (id)
             )"""
         )
         count = conn.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"]
@@ -116,16 +134,64 @@ def list_batches(_user: dict = Depends(current_user)):
     return rows
 
 
+@app.get("/api/pressures")
+def list_pressures(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT p.id, p.pot_no, p.pressure_text, p.read_at, p.created_by,
+                      p.used_by_batch_id, b.herb AS linked_herb, b.verdict AS linked_verdict
+               FROM pressure_readings p
+               LEFT JOIN batches b ON b.id = p.used_by_batch_id
+               ORDER BY p.id DESC"""
+        ).fetchall()
+    return rows
+
+
+@app.post("/api/pressures", status_code=201)
+def create_pressure(body: PressureIn, user: dict = Depends(require_writer)):
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        row = conn.execute(
+            """INSERT INTO pressure_readings (pot_no, pressure_text, read_at, created_by, created_at)
+               VALUES (%s, %s, %s, %s, %s)
+               RETURNING id, pot_no, pressure_text, read_at, created_by""",
+            (body.pot_no.strip(), body.pressure_text.strip(), body.read_at or now, user["username"], now),
+        ).fetchone()
+        conn.commit()
+    return row
+
+
 @app.post("/api/batches", status_code=201)
 def create_batch(body: BatchIn, user: dict = Depends(require_writer)):
+    if body.pressure_id is None:
+        raise HTTPException(status_code=400, detail="写入清炒必须挂靠一条未使用的蒸汽压力记录")
     doc = {"steps": [s.model_dump() for s in body.steps]}
     verdict, reason = judge(doc)
     with connect() as conn:
+        pressure = conn.execute(
+            """SELECT id, pot_no, pressure_text, read_at, used_by_batch_id
+               FROM pressure_readings WHERE id = %s FOR UPDATE""",
+            (body.pressure_id,),
+        ).fetchone()
+        if pressure is None:
+            raise HTTPException(status_code=404, detail="蒸汽压力记录不存在")
+        if pressure["used_by_batch_id"] is not None:
+            raise HTTPException(status_code=409, detail="该压力记录已挂靠过文书，请另选未使用记录")
+        doc["pressure"] = {
+            "id": pressure["id"],
+            "pot_no": pressure["pot_no"],
+            "text": pressure["pressure_text"],
+            "read_at": pressure["read_at"].isoformat(),
+        }
         row = conn.execute(
             """INSERT INTO batches (herb, doc, verdict, reason, created_by, created_at)
                VALUES (%s, %s::jsonb, %s, %s, %s, %s)
                RETURNING id, herb, doc, verdict, reason, created_by""",
             (body.herb.strip(), json.dumps(doc, ensure_ascii=False), verdict, reason, user["username"], datetime.now(timezone.utc)),
         ).fetchone()
+        conn.execute(
+            "UPDATE pressure_readings SET used_by_batch_id = %s WHERE id = %s",
+            (row["id"], pressure["id"]),
+        )
         conn.commit()
     return row
